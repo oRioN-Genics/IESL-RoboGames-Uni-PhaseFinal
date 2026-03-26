@@ -1,9 +1,15 @@
 """
-Task/line_follow_test.py
+Task/flight.py
 
 Autonomous drone line follower with AprilTag-based airport navigation.
 Includes dynamic sensor hand-off, active search, anti-U-turn routing,
 smart fence rejection, and dynamic junction stiffening.
+
+Changes vs previous version:
+  - Auto-starts line following after takeoff (no manual F key needed)
+  - Uses full frame for line detection until the line is held for
+    ROI_ACQUIRE_TIME seconds, then switches to the normal ROI crop
+  - Increased forward/lateral speeds and gain for faster navigation
 """
 
 from perception.line_detector import LineDetector, LineDetectorConfig, Strategy
@@ -33,57 +39,64 @@ Airports = [1, 2]   # ← set these to the required country codes
 # TUNING
 # ─────────────────────────────────────────────────────────────────────────────
 
-FORWARD_SPEED = 0.15
-SLOW_SPEED = 0.08
+FORWARD_SPEED   = 0.35      # was 0.15 — main cruise speed
+SLOW_SPEED      = 0.18      # was 0.08 — used in TAG_REACQUIRE creep
+CREEP_SPEED     = 0.25      # was 0.15 — manual creep key
 
 KP_YAW = -0.025
 KD_YAW = -0.004
 
-KP_LAT = 0.0004
+KP_LAT = 0.0006             # was 0.0004 — more lateral authority at higher speed
 KD_LAT = 0.0001
 
-THRESHOLD = 155
+THRESHOLD    = 155
 ROI_TOP_FRAC = 0.40
-ALTITUDE = 1.5
+ALTITUDE     = 1.5
 
 MAX_YAW = 0.50
-MAX_LAT = 0.12
+MAX_LAT = 0.20              # was 0.12
 
 YAW_SLEW = 0.20
 
-HIGH_BEND_ANGLE = 28.0
+HIGH_BEND_ANGLE   = 28.0
 HIGH_BEND_MAX_YAW = 1.50
-HIGH_BEND_SLEW = 1.00
+HIGH_BEND_SLEW    = 1.00
 
-TAG_ALIGN_P_LAT = 0.0015
-TAG_ALIGN_P_FWD = 0.0015
+TAG_ALIGN_P_LAT   = 0.0015
+TAG_ALIGN_P_FWD   = 0.0015
 TAG_ALIGN_MAX_VEL = 0.12
 TAG_ALIGN_DEADZONE = 25
 
-PRE_LAND_OFFSET_X = 0
-PRE_LAND_OFFSET_Y = 10
-PRE_LAND_DEADZONE_X = 80
-PRE_LAND_DEADZONE_Y = 80
-PRE_LAND_LOCK_FRAMES = 2
-PRE_LAND_MAX_VEL = 0.10
+PRE_LAND_OFFSET_X      = 0
+PRE_LAND_OFFSET_Y      = 10
+PRE_LAND_DEADZONE_X    = 80
+PRE_LAND_DEADZONE_Y    = 80
+PRE_LAND_LOCK_FRAMES   = 2
+PRE_LAND_MAX_VEL       = 0.10
 PRE_LAND_MAX_ALIGN_TIME = 20.0
 
-YAW_DEAD_ZONE = 2.0
-LAT_DEAD_ZONE = 5.0
-EMA_ALPHA = 0.40
+YAW_DEAD_ZONE    = 2.0
+LAT_DEAD_ZONE    = 5.0
+EMA_ALPHA        = 0.40
 ALIGN_THRESHOLD_DEG = 8.0
-BEND_SLOW_ANGLE = 15.0
-LINE_LOSS_GRACE = 15
-TAG_DETECT_INTERVAL = 3
-TAG_MIN_AREA = 800
-TAG_HOVER_TIME = 2.0
+BEND_SLOW_ANGLE  = 15.0
+LINE_LOSS_GRACE  = 15
+TAG_DETECT_INTERVAL  = 3
+TAG_MIN_AREA     = 800
+TAG_HOVER_TIME   = 2.0
 TAG_APPROACH_SLOW = 0.08
 TAG_DETECT_CENTER_DEADZONE_X = 220
 TAG_DETECT_CENTER_DEADZONE_Y = 170
-TAG_MASK_PAD = 8
+TAG_MASK_PAD         = 8
 TAG_MASK_HOLD_FRAMES = 5
 BORDER_MARGIN_PX = 10
-EDGE_PENALTY_PX = 28
+EDGE_PENALTY_PX  = 28
+
+# ── ROI bootstrap ─────────────────────────────────────────────────────────────
+# How many consecutive seconds of confident line following (confidence > this
+# threshold) must pass before we narrow perception to the ROI crop.
+ROI_ACQUIRE_TIME       = 4.0   # seconds
+ROI_ACQUIRE_MIN_CONF   = 0.50  # minimum confidence to count toward the timer
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -91,14 +104,14 @@ EDGE_PENALTY_PX = 28
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NavState(Enum):
-    LINE_FOLLOW = auto()
-    TAG_HOVER = auto()
-    DECIDING = auto()
-    PRE_LAND_ALIGN = auto()
-    TAG_REACQUIRE = auto()
-    LANDING = auto()
+    LINE_FOLLOW      = auto()
+    TAG_HOVER        = auto()
+    DECIDING         = auto()
+    PRE_LAND_ALIGN   = auto()
+    TAG_REACQUIRE    = auto()
+    LANDING          = auto()
     POST_LAND_SEARCH = auto()
-    DONE = auto()
+    DONE             = auto()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +152,8 @@ def arm_and_takeoff(m, alt):
             print("[MAVLink] Armed ✅")
             break
         time.sleep(0.3)
+    else:
+        raise RuntimeError("[MAVLink] Arming failed — aborting mission")
 
     m.mav.command_long_send(
         m.target_system, m.target_component,
@@ -260,16 +275,10 @@ def keep_line_contour(mask, prev_cx=None, min_area=120, min_thickness=12,
             abs(bottom_x - desired_x)
         area_reward = min(cv2.contourArea(cnt) / 250.0, 20.0)
 
-        # ── FIX 1: Smarter Fence Penalty ──
         penalty = 0.0
         x1, y1, bw, bh = cv2.boundingRect(cnt)
-
-        # Check if contour touches edges
-        hugs_border = (x1 <= 15) or ((x1 + bw) >= (w - 15))
+        hugs_border   = (x1 <= 15) or ((x1 + bw) >= (w - 15))
         touches_bottom = np.any(ys >= (h - 15))
-
-        # If it touches the side but DOES NOT come from the bottom, it's probably the fence.
-        # If it touches both, it's a sharp 90-degree outgoing turn.
         if hugs_border and not touches_bottom:
             penalty += 500.0
 
@@ -338,7 +347,7 @@ def tag_is_centered(tag: TagResult, frame_shape, target_offset_x=0.0,
 
 def draw_ann(roi, mask, result, frame_w, error, vy, yr, nav_state,
              following, aligning, creep, thresh, alt, fps,
-             tag_info_str, targets_remaining):
+             tag_info_str, targets_remaining, roi_active):
     h, w = roi.shape[:2]
     cx = w // 2
     vis = roi.copy()
@@ -370,8 +379,9 @@ def draw_ann(roi, mask, result, frame_w, error, vy, yr, nav_state,
     elif aligning:
         state_str = "[ALIGNING]"
 
+    roi_str = "ROI:ON" if roi_active else "ROI:SEARCH"
     lines = [
-        f"Alt:{alt:.2f}m  FPS:{fps:.1f}  [{state_str}]",
+        f"Alt:{alt:.2f}m  FPS:{fps:.1f}  [{state_str}]  {roi_str}",
         f"Thresh:{thresh}  Conf:{result.confidence:.2f}",
         f"LateralErr:{error:+.1f}px  Angle:{result.angle_deg:+.1f}deg",
         f"vy={vy:+.3f} m/s   yaw={yr:+.3f} r/s",
@@ -431,48 +441,58 @@ def run():
     cv2.moveWindow("Full frame",      0,  420)
 
     # ── State ─────────────────────────────────────────────────────────────
-    following = False
-    creep = False
-    tuner_on = False
-    thresh = [THRESHOLD]
-    vy_cmd = 0.0
-    yr_cmd = 0.0
-    prev_yr = prev_angle = prev_error = 0.0
+    # Auto-start: drone begins searching for line immediately after takeoff.
+    following  = True
+    aligning   = True
+    creep      = False
+    tuner_on   = False
+    thresh     = [THRESHOLD]
+    vy_cmd     = 0.0
+    yr_cmd     = 0.0
+    prev_yr    = prev_angle = prev_error = 0.0
     smooth_angle = smooth_error = 0.0
-    aligning = False
-    fps = 0.0
-    t_prev = t_ctrl = time.time()
+    fps        = 0.0
+    t_prev     = t_ctrl = time.time()
     line_lost_count = frame_count = 0
-    alt = ALTITUDE
-    current_heading = 0.0
-    prev_line_cx = None
+    alt        = ALTITUDE
+    current_heading  = 0.0
+    prev_line_cx     = None
 
-    nav_state = NavState.LINE_FOLLOW
-    tag_info_str = ""
+    # ── ROI bootstrap state ───────────────────────────────────────────────
+    # Start with full-frame line search. Once the line is held at sufficient
+    # confidence for ROI_ACQUIRE_TIME seconds we narrow to the ROI crop.
+    roi_active          = False
+    line_acquired_since: float | None = None   # timestamp of first good detection
+
+    nav_state        = NavState.LINE_FOLLOW
+    tag_info_str     = ""
     current_tag: TagResult | None = None
-    tag_hover_start = pre_land_start = tag_reacquire_start = 0.0
+    tag_hover_start  = pre_land_start = tag_reacquire_start = 0.0
     pre_land_lock_count = 0
-    targets_remaining = list(Airports)
-    visited_tags = set()
+    targets_remaining   = [c for c in Airports if c != 0]
+    visited_tags        = set()
     last_tag_detections = []
-    tag_mask_memory = []
-    tag_mask_hold = 0
-    arrival_heading = 0.0
+    tag_mask_memory     = []
+    tag_mask_hold       = 0
+    arrival_heading     = 0.0
 
+    # Sentinel used for the very first loop iteration before a real frame
+    # arrives — keeps the velocity output section safe.
     class _Empty:
-        confidence = 0.0
-        angle_deg = 0.0
-        is_detected = False
+        confidence   = 0.0
+        angle_deg    = 0.0
+        is_detected  = False
         slice_points = []
-        centroid_x = 160.0
+        centroid_x   = 160.0
         def lateral_error(self, w): return 0.0
 
     result = _Empty()
-    error = 0.0
-    blank = np.zeros((200, 320, 3), dtype=np.uint8)
+    error  = 0.0
+    roi    = np.zeros((200, 320, 3), dtype=np.uint8)  # safe initial value
+    mask   = np.zeros((200, 320),    dtype=np.uint8)
 
-    print("\n[Test] Ready.")
-    print(f"  Target countries: {Airports}")
+    print("\n[Test] Ready — auto-starting line search.")
+    print(f"  Target countries: {[c for c in Airports if c != 0]}")
     print("  F=follow  C=creep  T=thresh  0=stop  Q=land\n")
 
     while True:
@@ -480,7 +500,7 @@ def run():
         msg = master.recv_match(blocking=False)
         while msg:
             if msg.get_type() == "GLOBAL_POSITION_INT":
-                alt = msg.relative_alt / 1000.0
+                alt             = msg.relative_alt / 1000.0
                 current_heading = msg.hdg / 100.0
             msg = master.recv_match(blocking=False)
 
@@ -497,29 +517,25 @@ def run():
                     smooth_angle = ema(smooth_angle, angle_for_ctrl, EMA_ALPHA)
                     smooth_error = ema(smooth_error, lat_for_ctrl, EMA_ALPHA)
 
-                    now = time.time()
-                    dt = max(now - t_ctrl, 0.01)
+                    now  = time.time()
+                    dt   = max(now - t_ctrl, 0.01)
                     t_ctrl = now
 
-                    p_yaw = KP_YAW * smooth_angle
-                    d_yaw = KD_YAW * (smooth_angle - prev_angle) / dt
+                    p_yaw  = KP_YAW * smooth_angle
+                    d_yaw  = KD_YAW * (smooth_angle - prev_angle) / dt
                     err_yaw = 0.005 * smooth_error
                     prev_angle = smooth_angle
 
                     angle_abs = abs(smooth_angle)
 
-                    # ── FIX 2: Dynamic Tag Stiffening Release ──
                     is_approaching_tag = False
                     if last_tag_detections:
                         best_tag_check = max(
                             last_tag_detections, key=tag_corner_area)
-                        # Release the steering lock if the tag is in the bottom 30% of the frame
-                        # (Meaning the drone is flying over it and needs to aggressively turn)
                         if best_tag_check.center[1] < (frame.shape[0] * 0.70):
                             is_approaching_tag = True
 
                     if is_approaching_tag:
-                        # Clamp max yaw heavily to prevent swerving into junction branches
                         dynamic_max_yaw = 0.15
                     else:
                         dynamic_max_yaw = HIGH_BEND_MAX_YAW if (
@@ -528,7 +544,6 @@ def run():
                     raw_yr = float(
                         np.clip(p_yaw + d_yaw + err_yaw, -dynamic_max_yaw, dynamic_max_yaw))
 
-                    # Limit slew rate to prevent sudden jerks
                     if is_approaching_tag:
                         dynamic_slew = 0.05
                     else:
@@ -572,7 +587,7 @@ def run():
                         best_tag = max(last_tag_detections,
                                        key=tag_corner_area)
                         tag_cx = best_tag.center[0]
-                        err_x = tag_cx - (frame_w / 2)
+                        err_x  = tag_cx - (frame_w / 2)
                         send_velocity(master, vx=0.15, vy=0,
                                       yaw_rate=float(err_x * 0.0015))
                         tag_info_str = "Gap bridge: tracking tag"
@@ -612,9 +627,11 @@ def run():
 
                     if frame_count % 10 == 0:
                         print(
-                            f"  [PRE_LAND_ALIGN] err_x={err_x:+.1f}px err_y={err_y:+.1f}px vx={vx_align:+.3f} vy={vy_align:+.3f} lock={pre_land_lock_count}/{PRE_LAND_LOCK_FRAMES}")
+                            f"  [PRE_LAND_ALIGN] err_x={err_x:+.1f}px err_y={err_y:+.1f}px "
+                            f"vx={vx_align:+.3f} vy={vy_align:+.3f} lock={pre_land_lock_count}/{PRE_LAND_LOCK_FRAMES}")
 
-                    tag_info_str = f"Pre-land align ex={err_x:+.1f}px ey={err_y:+.1f}px lock={pre_land_lock_count}/{PRE_LAND_LOCK_FRAMES}"
+                    tag_info_str = (f"Pre-land align ex={err_x:+.1f}px ey={err_y:+.1f}px "
+                                    f"lock={pre_land_lock_count}/{PRE_LAND_LOCK_FRAMES}")
                     send_velocity(master, vx=vx_align,
                                   vy=vy_align, yaw_rate=0.0)
                 else:
@@ -634,7 +651,7 @@ def run():
                 tag_info_str = "Sweeping for new outgoing line..."
 
         elif creep:
-            send_velocity(master, vx=0.15)
+            send_velocity(master, vx=CREEP_SPEED)
 
         # ── Read frame ────────────────────────────────────────────────────
         try:
@@ -651,8 +668,8 @@ def run():
             continue
 
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        frame_w = frame.shape[1]
-        roi_y = int(frame.shape[0] * ROI_TOP_FRAC)
+        frame_w    = frame.shape[1]
+        roi_y      = int(frame.shape[0] * ROI_TOP_FRAC)
 
         # ── Perception: AprilTag ──────────────────────────────────────────
         if (frame_count % TAG_DETECT_INTERVAL == 0) or (nav_state in (NavState.TAG_HOVER, NavState.PRE_LAND_ALIGN)):
@@ -664,9 +681,9 @@ def run():
 
             if last_tag_detections:
                 tag_mask_memory = list(last_tag_detections)
-                tag_mask_hold = TAG_MASK_HOLD_FRAMES
-                best_tag = max(last_tag_detections, key=tag_corner_area)
-                area = tag_corner_area(best_tag)
+                tag_mask_hold   = TAG_MASK_HOLD_FRAMES
+                best_tag        = max(last_tag_detections, key=tag_corner_area)
+                area            = tag_corner_area(best_tag)
 
                 if following and nav_state == NavState.LINE_FOLLOW:
                     centered_for_capture, cap_ex, cap_ey = tag_is_centered(
@@ -674,15 +691,15 @@ def run():
                         deadzone_y=TAG_DETECT_CENTER_DEADZONE_Y)
 
                     if (best_tag.tag_id not in visited_tags and area > TAG_MIN_AREA and centered_for_capture):
-                        nav_state = NavState.TAG_HOVER
+                        nav_state       = NavState.TAG_HOVER
                         arrival_heading = current_heading
-                        current_tag = best_tag
+                        current_tag     = best_tag
                         tag_hover_start = time.time()
-                        tag_info_str = str(best_tag)
+                        tag_info_str    = str(best_tag)
 
                         send_velocity(master)
                         prev_yr = prev_angle = prev_error = smooth_angle = smooth_error = 0.0
-                        t_ctrl = time.time()
+                        t_ctrl  = time.time()
                         print(f"\n[Nav] Tag detected! {best_tag}")
                         print(
                             f"[Nav] → TAG_HOVER (area={area:.0f}, heading saved: {arrival_heading:.1f}°)")
@@ -696,11 +713,36 @@ def run():
                     current_tag = None
 
         # ── Perception: Line ──────────────────────────────────────────────
-        roi = frame[roi_y:, :]
-        mask = make_mask(roi, thresh[0])
-        mask, prev_line_cx = keep_line_contour(mask, prev_cx=prev_line_cx)
+        # Before ROI is active use the full frame so the drone can find the
+        # line from any position after takeoff. Once it has tracked
+        # confidently for ROI_ACQUIRE_TIME seconds, narrow to the ROI crop.
+        if roi_active:
+            roi = frame[roi_y:, :]
+        else:
+            roi = frame           # full frame search
+
+        mask, prev_line_cx = keep_line_contour(
+            make_mask(roi, thresh[0]), prev_cx=prev_line_cx)
         result = detector.detect(mask)
-        error = result.lateral_error(frame_w)
+        error  = result.lateral_error(frame_w)
+
+        # ── ROI acquisition timer ─────────────────────────────────────────
+        if not roi_active:
+            if (nav_state == NavState.LINE_FOLLOW
+                    and result.confidence >= ROI_ACQUIRE_MIN_CONF
+                    and not aligning):
+                if line_acquired_since is None:
+                    line_acquired_since = time.time()
+                    print("[Nav] Line acquired — starting ROI acquisition timer ...")
+                elif time.time() - line_acquired_since >= ROI_ACQUIRE_TIME:
+                    roi_active          = True
+                    line_acquired_since = None
+                    prev_line_cx        = None   # x-coords stay the same but reset for safety
+                    print("[Nav] ✅ ROI activated — switching to ROI-based line following")
+            else:
+                # Reset timer if we lose the line or leave LINE_FOLLOW
+                if line_acquired_since is not None:
+                    line_acquired_since = None
 
         # ── State transitions logic ───────────────────────────────────────
         if nav_state == NavState.TAG_HOVER:
@@ -710,7 +752,7 @@ def run():
                     current_tag = max(final_tags, key=tag_corner_area)
 
                 if current_tag is not None:
-                    nav_state = NavState.DECIDING
+                    nav_state    = NavState.DECIDING
                     tag_info_str = str(current_tag)
                     print(f"[Nav] → DECIDING: {current_tag}")
                 else:
@@ -726,24 +768,24 @@ def run():
                     deadzone_y=PRE_LAND_DEADZONE_Y)
                 print(
                     f"[Nav] ✅ MATCH! Country {current_tag.country_code} is landable!")
-                nav_state = NavState.PRE_LAND_ALIGN
-                pre_land_start = time.time()
+                nav_state           = NavState.PRE_LAND_ALIGN
+                pre_land_start      = time.time()
                 pre_land_lock_count = PRE_LAND_LOCK_FRAMES if centered_now else 0
-                tag_info_str = f"Target {current_tag.tag_id}: fine-aligning before landing"
+                tag_info_str        = f"Target {current_tag.tag_id}: fine-aligning before landing"
                 print("[Nav] → PRE_LAND_ALIGN")
             else:
                 reason = "wrong country" if current_tag.country_code not in targets_remaining else "unsafe"
                 print(
                     f"[Nav] ❌ Skip airport — {reason} (tag {current_tag.tag_id})")
-                nav_state = NavState.TAG_REACQUIRE
+                nav_state           = NavState.TAG_REACQUIRE
                 tag_reacquire_start = time.time()
-                tag_info_str = f"Skipped tag {current_tag.tag_id} ({reason}) — finding line..."
-                current_tag = None
+                tag_info_str        = f"Skipped tag {current_tag.tag_id} ({reason}) — finding line..."
+                current_tag         = None
                 print("[Nav] → TAG_REACQUIRE (creeping forward to find line)")
 
         if nav_state == NavState.PRE_LAND_ALIGN:
             if pre_land_lock_count >= PRE_LAND_LOCK_FRAMES and current_tag is not None:
-                print(f"[Nav] ✅ Pre-land alignment locked. → LANDING")
+                print("[Nav] ✅ Pre-land alignment locked. → LANDING")
                 nav_state = NavState.LANDING
                 send_velocity(master)
                 time.sleep(0.4)
@@ -761,7 +803,7 @@ def run():
                 print(f"[Nav] Landed! Targets remaining: {targets_remaining}")
 
                 if not targets_remaining:
-                    nav_state = NavState.DONE
+                    nav_state    = NavState.DONE
                     print("[Nav] 🎉 ALL TARGETS REACHED — MISSION COMPLETE!")
                     tag_info_str = "MISSION COMPLETE!"
                 else:
@@ -769,9 +811,14 @@ def run():
                     arm_and_takeoff(master, ALTITUDE)
                     time.sleep(2.0)
 
-                    nav_state = NavState.POST_LAND_SEARCH
-                    following = True
-                    aligning = False
+                    # After re-takeoff: keep ROI active (we already know
+                    # the field), but reset the line continuity tracker.
+                    prev_line_cx        = None
+                    line_acquired_since = None
+
+                    nav_state    = NavState.POST_LAND_SEARCH
+                    following    = True
+                    aligning     = False
                     print(
                         f"[Nav] → POST_LAND_SEARCH (avoiding {(arrival_heading+180) % 360:.0f}°)")
 
@@ -787,17 +834,17 @@ def run():
                     pre_land_lock_count = PRE_LAND_LOCK_FRAMES
                 else:
                     print("[Nav] Pre-land alignment timeout — retrying TAG_HOVER")
-                    nav_state = NavState.TAG_HOVER
-                    tag_hover_start = time.time()
+                    nav_state           = NavState.TAG_HOVER
+                    tag_hover_start     = time.time()
                     pre_land_lock_count = 0
 
         # ── Line Re-acquisition Logic ────────────────────────────────────
         if following and result.is_detected:
             if nav_state == NavState.TAG_REACQUIRE:
-                nav_state = NavState.LINE_FOLLOW
-                aligning = True
-                prev_yr = prev_angle = prev_error = smooth_angle = smooth_error = 0.0
-                t_ctrl = time.time()
+                nav_state    = NavState.LINE_FOLLOW
+                aligning     = True
+                prev_yr      = prev_angle = prev_error = smooth_angle = smooth_error = 0.0
+                t_ctrl       = time.time()
                 prev_line_cx = None
                 tag_info_str = f"Line re-acquired — targets: {targets_remaining}"
                 print("[Nav] Line re-acquired! → LINE_FOLLOW")
@@ -805,15 +852,15 @@ def run():
             elif nav_state == NavState.POST_LAND_SEARCH:
                 if result.confidence > 0.3:
                     return_hdg = (arrival_heading + 180.0) % 360.0
-                    diff = abs(current_heading - return_hdg)
+                    diff       = abs(current_heading - return_hdg)
                     if diff > 180:
                         diff = 360 - diff
 
                     if diff > 60:
-                        nav_state = NavState.LINE_FOLLOW
-                        aligning = True
-                        prev_yr = prev_angle = prev_error = smooth_angle = smooth_error = 0.0
-                        t_ctrl = time.time()
+                        nav_state    = NavState.LINE_FOLLOW
+                        aligning     = True
+                        prev_yr      = prev_angle = prev_error = smooth_angle = smooth_error = 0.0
+                        t_ctrl       = time.time()
                         prev_line_cx = None
                         print(
                             f"[Nav] Valid outgoing line found at {current_heading:.0f}°! → LINE_FOLLOW")
@@ -823,18 +870,20 @@ def run():
         # ── FPS & Display ─────────────────────────────────────────────────
         frame_count += 1
         if frame_count % 15 == 0:
-            t_now = time.time()
-            fps = 15 / (t_now - t_prev + 1e-6)
+            t_now  = time.time()
+            fps    = 15 / (t_now - t_prev + 1e-6)
             t_prev = t_now
 
         if following and frame_count % 20 == 0:
             if nav_state in (NavState.LINE_FOLLOW, NavState.TAG_REACQUIRE, NavState.POST_LAND_SEARCH):
                 print(f"  [{nav_state.name}] hdg={current_heading:03.0f}° conf={result.confidence:.2f}  "
-                      f"err={error:+5.1f}px  ang={result.angle_deg:+5.1f}°  vy={vy_cmd:+.3f}  yr={yr_cmd:+.3f}")
+                      f"err={error:+5.1f}px  ang={result.angle_deg:+5.1f}°  vy={vy_cmd:+.3f}  yr={yr_cmd:+.3f}  "
+                      f"{'[FULL]' if not roi_active else '[ROI]'}")
 
         ann = draw_ann(roi, mask, result, frame_w, error, vy_cmd, yr_cmd, nav_state,
-                       following, aligning, creep, thresh[0], alt, fps, tag_info_str, len(targets_remaining))
-        msk = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+                       following, aligning, creep, thresh[0], alt, fps,
+                       tag_info_str, len(targets_remaining), roi_active)
+        msk      = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         full_vis = frame.copy()
         if last_tag_detections:
             draw_tags_on_frame(full_vis, last_tag_detections)
@@ -854,12 +903,12 @@ def run():
         elif key == ord("f"):
             following = not following
             if following:
-                creep = False
-                aligning = True
-                prev_yr = prev_angle = prev_error = smooth_angle = smooth_error = 0.0
-                t_ctrl = time.time()
-                nav_state = NavState.LINE_FOLLOW
-                print(f"\n[Follow] ON — aligning to line first ...")
+                creep        = False
+                aligning     = True
+                prev_yr      = prev_angle = prev_error = smooth_angle = smooth_error = 0.0
+                t_ctrl       = time.time()
+                nav_state    = NavState.LINE_FOLLOW
+                print("\n[Follow] ON — aligning to line first ...")
             else:
                 send_velocity(master)
                 aligning = False
