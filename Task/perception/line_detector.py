@@ -9,6 +9,7 @@ Two detection strategies are available and can be selected via config:
   Strategy.SLIDING_WINDOW  — best for curved lines (your arena)
       Divides the mask into N horizontal slices.
       Finds the centroid of white pixels in each slice.
+      Utilizes 1D spatial clustering to prevent averaging at junctions.
       Fits a line through those centroids.
 
   Strategy.HOUGH           — best for straight segments, fast
@@ -70,6 +71,7 @@ class LineDetectorConfig:
     # Sliding window
     num_slices:      int = 6      # horizontal scan lines
     min_pixels:      int = 10     # min white pixels to count a slice as valid
+    cluster_gap:     int = 10     # NEW: pixels gap to separate left/right branches at junctions
 
     # Hough
     canny_low:       int = 50
@@ -120,7 +122,7 @@ class LineDetector:
             return self._hough(mask)
 
     # ------------------------------------------------------------------
-    # Strategy A: Sliding window
+    # Strategy A: Sliding window (with Branch Lock)
     # ------------------------------------------------------------------
 
     def _sliding_window(self, mask: np.ndarray) -> LineResult:
@@ -132,19 +134,25 @@ class LineDetector:
         slice_h = h // self.cfg.num_slices
 
         valid_points = []   # (x, y) centroids of valid slices
+        
+        # Start looking for the line near the center of the bottom of the frame
+        current_target_x = w / 2.0 
 
         for i in range(self.cfg.num_slices):
             # Work bottom-up: slice 0 = bottom (closest to drone)
             y_bot = h - i * slice_h
-            y_top = y_bot - slice_h
-            y_top = max(y_top, 0)
+            y_top = max(y_bot - slice_h, 0)
 
             strip = mask[y_top:y_bot, :]
-            cx = self._centroid_x(strip)
+            
+            # Pass the target_x to help the function choose the correct branch at a junction
+            cx = self._centroid_x(strip, target_x=current_target_x)
 
             if cx is not None:
                 y_mid = (y_top + y_bot) // 2
                 valid_points.append((cx, y_mid))
+                # Update the target_x for the next slice up to track this specific branch
+                current_target_x = cx
 
         if len(valid_points) < 2:
             # Not enough slices fired — no confident detection
@@ -250,16 +258,33 @@ class LineDetector:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _centroid_x(self, strip: np.ndarray) -> float | None:
+    def _centroid_x(self, strip: np.ndarray, target_x: float) -> float | None:
         """
-        Return the x centroid of white pixels in a horizontal strip.
-        Returns None if fewer than min_pixels are white.
+        Return the x centroid of the white pixel cluster closest to the target_x.
+        This prevents averaging left and right branches at a junction.
         """
-        white_cols = np.where(strip > 0)
+        white_cols = np.where(strip > 0)[1]
 
-        if len(white_cols[1]) < self.cfg.min_pixels:
+        if len(white_cols) < self.cfg.min_pixels:
             return None
-        return float(np.mean(white_cols[1]))
+            
+        # 1D Clustering: Find gaps > cluster_gap to separate left/right branches
+        jumps = np.where(np.diff(white_cols) > self.cfg.cluster_gap)[0]
+        branches = np.split(white_cols, jumps + 1)
+        
+        # Calculate the mean X for each distinct branch that meets the pixel threshold
+        branch_centers = [np.mean(branch) for branch in branches if len(branch) >= self.cfg.min_pixels]
+        
+        if not branch_centers:
+            return None
+            
+        if len(branch_centers) == 1:
+            return float(branch_centers[0])
+            
+        # JUNCTION DETECTED: Multiple branches found in this slice.
+        # Pick the branch whose center is closest to the target_x from the slice below
+        best_center = min(branch_centers, key=lambda cx: abs(cx - target_x))
+        return float(best_center)
 
     @staticmethod
     def _fit_angle(xs: np.ndarray, ys: np.ndarray) -> float:

@@ -39,12 +39,12 @@ Airports = [1, 2]   # ← set these to the required country codes
 # TUNING
 # ─────────────────────────────────────────────────────────────────────────────
 
-FORWARD_SPEED   = 0.35      # was 0.15 — main cruise speed
-SLOW_SPEED      = 0.18      # was 0.08 — used in TAG_REACQUIRE creep
-CREEP_SPEED     = 0.25      # was 0.15 — manual creep key
+FORWARD_SPEED   = 0.28      # was 0.15 — main cruise speed
+SLOW_SPEED      = 0.15      # was 0.08 — used in TAG_REACQUIRE creep
+CREEP_SPEED     = 0.20      # was 0.15 — manual creep key
 
-KP_YAW = -0.025
-KD_YAW = -0.004
+KP_YAW = -0.020
+KD_YAW = -0.008
 
 KP_LAT = 0.0006             # was 0.0004 — more lateral authority at higher speed
 KD_LAT = 0.0001
@@ -56,7 +56,7 @@ ALTITUDE     = 1.5
 MAX_YAW = 0.50
 MAX_LAT = 0.20              # was 0.12
 
-YAW_SLEW = 0.20
+YAW_SLEW = 0.15
 
 HIGH_BEND_ANGLE   = 28.0
 HIGH_BEND_MAX_YAW = 1.50
@@ -69,8 +69,8 @@ TAG_ALIGN_DEADZONE = 25
 
 PRE_LAND_OFFSET_X      = 0
 PRE_LAND_OFFSET_Y      = 10
-PRE_LAND_DEADZONE_X    = 80
-PRE_LAND_DEADZONE_Y    = 80
+PRE_LAND_DEADZONE_X    = 40
+PRE_LAND_DEADZONE_Y    = 40
 PRE_LAND_LOCK_FRAMES   = 2
 PRE_LAND_MAX_VEL       = 0.10
 PRE_LAND_MAX_ALIGN_TIME = 20.0
@@ -83,7 +83,7 @@ BEND_SLOW_ANGLE  = 15.0
 LINE_LOSS_GRACE  = 15
 TAG_DETECT_INTERVAL  = 3
 TAG_MIN_AREA     = 800
-TAG_HOVER_TIME   = 2.0
+TAG_HOVER_TIME   = 4.0
 TAG_APPROACH_SLOW = 0.08
 TAG_DETECT_CENTER_DEADZONE_X = 220
 TAG_DETECT_CENTER_DEADZONE_Y = 170
@@ -508,10 +508,11 @@ def run():
         if following and nav_state not in (NavState.LANDING, NavState.DONE):
 
             if nav_state == NavState.LINE_FOLLOW:
-                if result.is_detected:
+                # Require at least 2 slices (0.33 conf) to trust the heading. 
+                # Otherwise, treat it as noise/lost line.
+                if result.is_detected and result.confidence >= 0.33:
                     line_lost_count = 0
-                    angle_for_ctrl = apply_dead_zone(
-                        result.angle_deg, YAW_DEAD_ZONE)
+                    angle_for_ctrl = apply_dead_zone(result.angle_deg, YAW_DEAD_ZONE)
                     lat_for_ctrl = apply_dead_zone(error, LAT_DEAD_ZONE)
 
                     smooth_angle = ema(smooth_angle, angle_for_ctrl, EMA_ALPHA)
@@ -530,8 +531,7 @@ def run():
 
                     is_approaching_tag = False
                     if last_tag_detections:
-                        best_tag_check = max(
-                            last_tag_detections, key=tag_corner_area)
+                        best_tag_check = max(last_tag_detections, key=tag_corner_area)
                         if best_tag_check.center[1] < (frame.shape[0] * 0.70):
                             is_approaching_tag = True
 
@@ -541,8 +541,7 @@ def run():
                         dynamic_max_yaw = HIGH_BEND_MAX_YAW if (
                             angle_abs > HIGH_BEND_ANGLE or abs(smooth_error) > 80) else MAX_YAW
 
-                    raw_yr = float(
-                        np.clip(p_yaw + d_yaw + err_yaw, -dynamic_max_yaw, dynamic_max_yaw))
+                    raw_yr = float(np.clip(p_yaw + d_yaw + err_yaw, -dynamic_max_yaw, dynamic_max_yaw))
 
                     if is_approaching_tag:
                         dynamic_slew = 0.05
@@ -550,8 +549,7 @@ def run():
                         dynamic_slew = HIGH_BEND_SLEW if (
                             angle_abs > HIGH_BEND_ANGLE or abs(smooth_error) > 80) else YAW_SLEW
 
-                    yr_cmd = float(np.clip(raw_yr, prev_yr -
-                                   dynamic_slew, prev_yr + dynamic_slew))
+                    yr_cmd = float(np.clip(raw_yr, prev_yr - dynamic_slew, prev_yr + dynamic_slew))
                     prev_yr = yr_cmd
 
                     p_lat = KP_LAT * smooth_error
@@ -563,10 +561,8 @@ def run():
                         vy_cmd *= 0.4
 
                     if angle_abs > BEND_SLOW_ANGLE or abs(smooth_error) > 80:
-                        scale_ang = max(0.4, 1.0 - (angle_abs - BEND_SLOW_ANGLE) /
-                                        90.0) if angle_abs > BEND_SLOW_ANGLE else 1.0
-                        scale_lat = max(
-                            0.2, 1.0 - (abs(smooth_error) - 80) / 150.0) if abs(smooth_error) > 80 else 1.0
+                        scale_ang = max(0.4, 1.0 - (angle_abs - BEND_SLOW_ANGLE) / 90.0) if angle_abs > BEND_SLOW_ANGLE else 1.0
+                        scale_lat = max(0.2, 1.0 - (abs(smooth_error) - 80) / 150.0) if abs(smooth_error) > 80 else 1.0
                         fwd_speed = FORWARD_SPEED * min(scale_ang, scale_lat)
                     else:
                         fwd_speed = FORWARD_SPEED
@@ -574,30 +570,38 @@ def run():
                     if aligning:
                         if abs(result.angle_deg) < ALIGN_THRESHOLD_DEG:
                             aligning = False
-                            print(
-                                f"[Align] Done — angle={result.angle_deg:+.1f}° → moving forward")
+                            print(f"[Align] Done — angle={result.angle_deg:+.1f}° → moving forward")
                         else:
                             send_velocity(master, vx=0, vy=0, yaw_rate=yr_cmd)
                     else:
-                        send_velocity(master, vx=fwd_speed,
-                                      vy=vy_cmd, yaw_rate=yr_cmd)
+                        send_velocity(master, vx=fwd_speed, vy=vy_cmd, yaw_rate=yr_cmd)
+                
                 else:
+                    # --- LINE LOST LOGIC ---
                     line_lost_count += 1
                     if last_tag_detections:
-                        best_tag = max(last_tag_detections,
-                                       key=tag_corner_area)
+                        best_tag = max(last_tag_detections, key=tag_corner_area)
                         tag_cx = best_tag.center[0]
                         err_x  = tag_cx - (frame_w / 2)
-                        send_velocity(master, vx=0.15, vy=0,
-                                      yaw_rate=float(err_x * 0.0015))
+                        send_velocity(master, vx=0.15, vy=0, yaw_rate=float(err_x * 0.0015))
                         tag_info_str = "Gap bridge: tracking tag"
                     elif line_lost_count <= LINE_LOSS_GRACE:
-                        send_velocity(master, vx=0.03, vy=0, yaw_rate=yr_cmd)
+                        # HARDBRAKE: Drift slightly forward, but KILL yaw and lateral velocity immediately
+                        send_velocity(master, vx=0.03, vy=0.0, yaw_rate=0.0)
                     else:
-                        send_velocity(master)
+                        # FULL STOP & EXPAND ROI
+                        send_velocity(master, vx=0.0, vy=0.0, yaw_rate=0.0)
+                        
+                        # Reset tracking state to prevent sudden jerks when line is found
                         vy_cmd = yr_cmd = prev_yr = prev_angle = prev_error = 0.0
                         smooth_angle = smooth_error = 0.0
                         t_ctrl = time.time()
+                        
+                        if roi_active:
+                            print("[Nav] Line lost! Expanding to FULL FRAME search and halting.")
+                            roi_active = False    # Expand vision
+                            aligning = True       # Force alignment when found again
+                            prev_line_cx = None   # Clear contour memory
 
             elif nav_state == NavState.TAG_HOVER:
                 if current_tag:
@@ -696,6 +700,7 @@ def run():
                         current_tag     = best_tag
                         tag_hover_start = time.time()
                         tag_info_str    = str(best_tag)
+                        roi_active = False
 
                         send_velocity(master)
                         prev_yr = prev_angle = prev_error = smooth_angle = smooth_error = 0.0
@@ -793,51 +798,41 @@ def run():
 
                 print("[Nav] Landing ...")
                 deadline = time.time() + 30
+                touchdown_time = None
+                
                 while time.time() < deadline:
-                    if not is_armed(master):
+                    # 1. Keep draining telemetry to get fresh altitude
+                    msg = master.recv_match(blocking=False)
+                    while msg:
+                        if msg.get_type() == "GLOBAL_POSITION_INT":
+                            alt = msg.relative_alt / 1000.0
+                        msg = master.recv_match(blocking=False)
+
+                    # 2. Keep camera buffer empty and display alive so it doesn't freeze
+                    try:
+                        cam_frame = get_frame(cam)
+                        if cam_frame is not None:
+                            last_frm = cam_frame
+                            cv2.imshow("Full frame", cam_frame)
+                            cv2.waitKey(1)
+                    except:
+                        pass
+                    
+                    # 3. Detect touchdown (altitude near ground) or auto-disarm
+                    if (alt < 0.2 or not is_armed(master)) and touchdown_time is None:
+                        print("[Nav] Touchdown detected! Waiting 7 seconds on the pad...")
+                        touchdown_time = time.time()
+                        
+                    # 4. Break loop after 7 seconds on the ground
+                    if touchdown_time is not None and (time.time() - touchdown_time) >= 7.0:
                         break
-                    time.sleep(0.5)
+                        
+                    time.sleep(0.05)
 
                 if current_tag.country_code in targets_remaining:
                     targets_remaining.remove(current_tag.country_code)
                 print(f"[Nav] Landed! Targets remaining: {targets_remaining}")
-
-                if not targets_remaining:
-                    nav_state    = NavState.DONE
-                    print("[Nav] 🎉 ALL TARGETS REACHED — MISSION COMPLETE!")
-                    tag_info_str = "MISSION COMPLETE!"
-                else:
-                    print("[Nav] Re-taking off to continue mission ...")
-                    arm_and_takeoff(master, ALTITUDE)
-                    time.sleep(2.0)
-
-                    # After re-takeoff: keep ROI active (we already know
-                    # the field), but reset the line continuity tracker.
-                    prev_line_cx        = None
-                    line_acquired_since = None
-
-                    nav_state    = NavState.POST_LAND_SEARCH
-                    following    = True
-                    aligning     = False
-                    print(
-                        f"[Nav] → POST_LAND_SEARCH (avoiding {(arrival_heading+180) % 360:.0f}°)")
-
-            elif (time.time() - pre_land_start) > PRE_LAND_MAX_ALIGN_TIME:
-                coarse_centered = False
-                if current_tag is not None:
-                    coarse_centered, _, _ = tag_is_centered(
-                        current_tag, frame.shape, target_offset_x=PRE_LAND_OFFSET_X,
-                        target_offset_y=PRE_LAND_OFFSET_Y, deadzone_x=PRE_LAND_DEADZONE_X * 1.5,
-                        deadzone_y=PRE_LAND_DEADZONE_Y * 1.5)
-                if coarse_centered and current_tag is not None:
-                    print("[Nav] Pre-land timeout, but tag is near center → landing")
-                    pre_land_lock_count = PRE_LAND_LOCK_FRAMES
-                else:
-                    print("[Nav] Pre-land alignment timeout — retrying TAG_HOVER")
-                    nav_state           = NavState.TAG_HOVER
-                    tag_hover_start     = time.time()
-                    pre_land_lock_count = 0
-
+        
         # ── Line Re-acquisition Logic ────────────────────────────────────
         if following and result.is_detected:
             if nav_state == NavState.TAG_REACQUIRE:
