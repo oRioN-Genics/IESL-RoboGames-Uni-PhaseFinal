@@ -456,7 +456,6 @@ def run():
     tag_hover_start  = pre_land_start = tag_reacquire_start = 0.0
     pre_land_lock_count = 0
     targets_remaining   = [c for c in Airports if c != 0]
-    visited_tags        = set()
     last_tag_detections = []
     tag_mask_memory     = []
     tag_mask_hold       = 0
@@ -679,7 +678,7 @@ def run():
                         best_tag, frame.shape, deadzone_x=TAG_DETECT_CENTER_DEADZONE_X,
                         deadzone_y=TAG_DETECT_CENTER_DEADZONE_Y)
 
-                    if (best_tag.tag_id not in visited_tags and area > TAG_MIN_AREA and centered_for_capture):
+                    if (best_tag.tag_id not in planner.visited_tags and area > TAG_MIN_AREA and centered_for_capture):
                         nav_state       = NavState.TAG_HOVER
                         arrival_heading = current_heading
                         current_tag     = best_tag
@@ -693,7 +692,7 @@ def run():
                         print(f"\n[Nav] Tag detected! {best_tag}")
                         print(
                             f"[Nav] → TAG_HOVER (area={area:.0f}, heading saved: {arrival_heading:.1f}°)")
-                    elif best_tag.tag_id not in visited_tags and area > TAG_MIN_AREA:
+                    elif best_tag.tag_id not in planner.visited_tags and area > TAG_MIN_AREA:
                         tag_info_str = f"Tag seen but off-center ex={cap_ex:+.0f}px ey={cap_ey:+.0f}px"
 
                 elif nav_state in (NavState.TAG_HOVER, NavState.PRE_LAND_ALIGN):
