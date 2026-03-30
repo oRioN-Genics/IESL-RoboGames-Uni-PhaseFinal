@@ -18,8 +18,7 @@ sys.path.insert(0, ".")
 # MISSION CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-Airports = [3, 0]
-
+Airports = [1, 2]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TUNING
@@ -355,6 +354,12 @@ def draw_tags_on_frame(vis, tags):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run():
+    targets_remaining = [c for c in Airports if c != 0]
+    if not targets_remaining:
+        print("[Nav] 🛑 No valid target countries provided (all set to 0).")
+        print("[Nav] Mission complete before takeoff. Aborting sequence.")
+        return  # Exits the script immediately without connecting or taking off
+    
     master = connect()
     arm_and_takeoff(master, ALTITUDE)
     
@@ -420,6 +425,7 @@ def run():
     tag_mask_hold       = 0
     arrival_heading     = 0.0
     touchdown_time      = None
+    last_loop_time      = 0.0
 
     # Sentinel used for the very first loop iteration before a real frame
     # arrives — keeps the velocity output section safe.
@@ -610,7 +616,16 @@ def run():
                         best_tag, frame.shape, deadzone_x=TAG_DETECT_CENTER_DEADZONE_X,
                         deadzone_y=TAG_DETECT_CENTER_DEADZONE_Y)
 
-                    if (best_tag.tag_id not in planner.visited_tags and area > TAG_MIN_AREA and centered_for_capture):
+                    # --- FIX 1: Notify Planner to trigger Anti-Loop for known tags ---
+                    if best_tag.tag_id in planner.visited_tags and area > TAG_MIN_AREA:
+                        # Only trigger once per flyover (10 second debounce)
+                        if time.time() - last_loop_time > 10.0:
+                            planner.on_tag_reached(best_tag.tag_id, best_tag.country_code, best_tag.is_landable)
+                            last_loop_time = time.time()
+                        tag_info_str = f"Skipping known tag {best_tag.tag_id}"
+
+                    # --- Normal capture for NEW tags ---
+                    elif (best_tag.tag_id not in planner.visited_tags and area > TAG_MIN_AREA and centered_for_capture):
                         nav_state       = NavState.TAG_HOVER
                         arrival_heading = current_heading
                         current_tag     = best_tag
@@ -654,9 +669,13 @@ def run():
         result = detector.detect(mask, turn_bias=current_turn_bias)
         
         if result.junction_detected and following:
-            current_turn_bias = planner.get_junction_decision(len(result.branch_centroids))
+            if current_turn_bias == "straight":
+                current_turn_bias = planner.get_junction_decision(len(result.branch_centroids))
+            
             result = detector.detect(mask, turn_bias=current_turn_bias) # Re-run with the forced bias
-            junction_cooldown = 45 
+            
+            # Hold the bias as long as the junction is visible, plus 30 frames AFTER it leaves view.
+            junction_cooldown = 30 
             
         error  = result.lateral_error(current_roi_w)
 
