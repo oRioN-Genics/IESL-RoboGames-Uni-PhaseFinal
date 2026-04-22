@@ -1,6 +1,7 @@
 from perception.line_detector import LineDetector, LineDetectorConfig, Strategy
 from perception.apriltag_detector import AprilTagDetector, TagResult
 from perception.camera import Camera
+from perception.streamer import MJPEGStreamer
 from navigation.mission_planner import MissionPlanner
 import math
 import sys
@@ -18,6 +19,8 @@ sys.path.insert(0, ".")
 # MISSION CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
+HEADLESS = True
+LIVE_STREAM_EN = False  # True = Broadcasts MJPEG stream on port 5000
 Airports = [1, 2]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -370,6 +373,9 @@ def run():
     # Initialize the threaded camera so the buffer never fills up
     cam = Camera(host="127.0.0.1", port=8080)
     cam.start()
+
+    if LIVE_STREAM_EN:
+        live_stream = MJPEGStreamer(port=5000)
     last_frm = None
 
     detector = LineDetector(LineDetectorConfig(
@@ -833,53 +839,58 @@ def run():
                       f"err={error:+5.1f}px  ang={result.angle_deg:+5.1f}°  vy={vy_cmd:+.3f}  yr={yr_cmd:+.3f}  "
                       f"{'[FULL]' if not roi_active else '[ROI]'}")
 
-        ann = draw_ann(roi, mask, result, frame_w, error, vy_cmd, yr_cmd, nav_state,
-                       following, aligning, creep, thresh[0], alt, fps,
-                       tag_info_str, len(targets_remaining), roi_active)
-        msk      = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        full_vis = frame.copy()
-        if last_tag_detections:
-            draw_tags_on_frame(full_vis, last_tag_detections)
+        if LIVE_STREAM_EN or not HEADLESS:
+            ann = draw_ann(roi, mask, result, frame_w, error, vy_cmd, yr_cmd, nav_state,
+                        following, aligning, creep, thresh[0], alt, fps,
+                        tag_info_str, len(targets_remaining), roi_active)
+            if LIVE_STREAM_EN:
+                live_stream.update_frame(ann)
 
-        cv2.imshow("Annotated ROI", ann)
-        cv2.imshow("Binary mask",   msk)
-        cv2.imshow("Full frame",    full_vis)
+        if not HEADLESS:
+            msk      = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            full_vis = frame.copy()
+            if last_tag_detections:
+                draw_tags_on_frame(full_vis, last_tag_detections)
 
-        # ── Keys ──────────────────────────────────────────────────────────
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            send_velocity(master)
-            time.sleep(0.3)
-            set_mode(master, "LAND")
-            print("[Test] Landing ...")
-            break
-        elif key == ord("f"):
-            following = not following
-            if following:
-                creep        = False
-                aligning     = True
-                prev_yr      = prev_angle = prev_error = smooth_angle = smooth_error = 0.0
-                t_ctrl       = time.time()
-                nav_state    = NavState.LINE_FOLLOW
-                print("\n[Follow] ON — aligning to line first ...")
-            else:
+            cv2.imshow("Annotated ROI", ann)
+            cv2.imshow("Binary mask",   msk)
+            cv2.imshow("Full frame",    full_vis)
+
+            # ── Keys ──────────────────────────────────────────────────────────
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 send_velocity(master)
-                aligning = False
-                print("[Follow] OFF")
-        elif key == ord("c") and not following:
-            creep = not creep
-            if not creep:
+                time.sleep(0.3)
+                set_mode(master, "LAND")
+                print("[Test] Landing ...")
+                break
+            elif key == ord("f"):
+                following = not following
+                if following:
+                    creep        = False
+                    aligning     = True
+                    prev_yr      = prev_angle = prev_error = smooth_angle = smooth_error = 0.0
+                    t_ctrl       = time.time()
+                    nav_state    = NavState.LINE_FOLLOW
+                    print("\n[Follow] ON — aligning to line first ...")
+                else:
+                    send_velocity(master)
+                    aligning = False
+                    print("[Follow] OFF")
+            elif key == ord("c") and not following:
+                creep = not creep
+                if not creep:
+                    send_velocity(master)
+                print(f"[Creep] {'ON' if creep else 'OFF'}")
+            elif key == ord("t") and not tuner_on:
+                cv2.createTrackbar("Threshold", "Binary mask",
+                                thresh[0], 255, lambda v: thresh.__setitem__(0, v))
+                tuner_on = True
+            elif key == ord("0"):
+                following = creep = False
+                nav_state = NavState.LINE_FOLLOW
                 send_velocity(master)
-            print(f"[Creep] {'ON' if creep else 'OFF'}")
-        elif key == ord("t") and not tuner_on:
-            cv2.createTrackbar("Threshold", "Binary mask",
-                               thresh[0], 255, lambda v: thresh.__setitem__(0, v))
-            tuner_on = True
-        elif key == ord("0"):
-            following = creep = False
-            nav_state = NavState.LINE_FOLLOW
-            send_velocity(master)
-            print("[Manual] Stopped")
+                print("[Manual] Stopped")
 
     cam.stop()
     cv2.destroyAllWindows()
