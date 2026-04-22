@@ -594,7 +594,7 @@ def run():
         # ── Read frame (using non-blocking Threaded Camera) ───────────────
         fetched_frame = cam.get_frame()
         if fetched_frame is not None:
-            frame = fetched_frame
+            frame = cv2.resize(fetched_frame, (640, 480))
             last_frm = frame
         else:
             frame = last_frm
