@@ -16,8 +16,8 @@ WorldInfo {
   FPS 20
 }
 Viewpoint {
-  orientation -0.04553246160058567 0.9861272845223173 0.1596238505400498 0.5632139273543915
-  position -13.474893589007404 -0.04807092375178046 8.581501580741683
+  orientation 0.16839940977402798 0.34514970683324786 -0.9233164780619276 0.9722378708002776
+  position -15.060962738793705 14.589817582690811 9.48501831576933
   follow "Iris"
   followSmoothness 0.01
 }
@@ -39,11 +39,11 @@ Solid {
   }
 }
 Solid {
-  translation 0.191359 1.64181 0.2
+  translation 0.191262 1.64173 0.003
   rotation -0.585968582159661 0.4637834404671435 -0.6644890827321817 0.01379684869420462
   children [
     TexturedBoxShape {
-      size 0.5 0.5 0.4
+      size 0.5 0.5 0.001
       textureUrl [
         "../images/103.png"
       ]
@@ -60,21 +60,13 @@ Solid {
   boundingObject DEF Landing_Pad Box {
     size 0.5 0.5 0.4
   }
-  physics Physics {
-    centerOfMass [
-      0 0 0
-    ]
-    damping Damping {
-      linear 1
-    }
-  }
 }
 Solid {
-  translation 2.84229 1.66768 0.2
+  translation 2.84229 1.66768 0.008
   rotation 0.999998029082405 -2.9599705557341236e-05 0.0019851839115580753 0.010319660510955488
   children [
     TexturedBoxShape {
-      size 0.5 0.5 0.4
+      size 0.5 0.5 0.0005
       textureUrl [
         "../images/203.png"
       ]
@@ -91,21 +83,13 @@ Solid {
   boundingObject DEF Landing_Pad Box {
     size 0.5 0.5 0.4
   }
-  physics Physics {
-    centerOfMass [
-      0 0 0
-    ]
-    damping Damping {
-      linear 1
-    }
-  }
 }
 Solid {
-  translation -2.95771 -0.312858 0.2
+  translation -2.95771 -0.312858 0.009
   rotation 0.999998029082405 -2.9599705557341236e-05 0.0019851839115580753 0.010319660510955488
   children [
     TexturedBoxShape {
-      size 0.5 0.5 0.4
+      size 0.5 0.5 0.005
       textureUrl [
         "../images/112.png"
       ]
@@ -122,21 +106,13 @@ Solid {
   boundingObject DEF Landing_Pad Box {
     size 0.5 0.5 0.4
   }
-  physics Physics {
-    centerOfMass [
-      0 0 0
-    ]
-    damping Damping {
-      linear 1
-    }
-  }
 }
 Solid {
-  translation -1.30767 -2.50267 0.199382
+  translation -1.30767 -2.50267 0.009
   rotation 0.999998029082405 -2.9599705557341236e-05 0.0019851839115580753 0.010319660510955488
   children [
     TexturedBoxShape {
-      size 0.5 0.5 0.4
+      size 0.5 0.5 0.005
       textureUrl [
         "../images/213.png"
       ]
@@ -153,21 +129,13 @@ Solid {
   boundingObject DEF Landing_Pad Box {
     size 0.5 0.5 0.4
   }
-  physics Physics {
-    centerOfMass [
-      0 0 0
-    ]
-    damping Damping {
-      linear 1
-    }
-  }
 }
 Solid {
-  translation 2.82231 -2.49263 0.199485
+  translation 2.82231 -2.49263 0.009
   rotation 0.999998029082405 -2.9599705557341236e-05 0.0019851839115580753 0.010319660510955488
   children [
     TexturedBoxShape {
-      size 0.5 0.5 0.4
+      size 0.5 0.5 0.005
       textureUrl [
         "../images/302.png"
       ]
@@ -183,14 +151,6 @@ Solid {
   name "landing_pad_stand_6"
   boundingObject DEF Landing_Pad Box {
     size 0.5 0.5 0.4
-  }
-  physics Physics {
-    centerOfMass [
-      0 0 0
-    ]
-    damping Damping {
-      linear 1
-    }
   }
 }
 Solid {
