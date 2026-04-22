@@ -37,7 +37,7 @@ KD_LAT = 0.0003
 THRESHOLD    = 155
 ROI_TOP_FRAC = 0.40
 ROI_SIDE_FRAC = 0.12
-ALTITUDE     = 1.5
+ALTITUDE     = 1.2   # lowered for better view of ground-level AprilTags
 
 MAX_YAW = 0.50
 MAX_LAT = 0.20
@@ -68,7 +68,7 @@ ALIGN_THRESHOLD_DEG = 8.0
 BEND_SLOW_ANGLE  = 15.0
 LINE_LOSS_GRACE  = 15
 TAG_DETECT_INTERVAL  = 3
-TAG_MIN_AREA     = 800
+TAG_MIN_AREA     = 1200  # higher minimum to focus on larger ground-level tag detections
 TAG_HOVER_TIME   = 4.0
 TAG_APPROACH_SLOW = 0.08
 TAG_DETECT_CENTER_DEADZONE_X = 220
@@ -374,7 +374,12 @@ def run():
 
     detector = LineDetector(LineDetectorConfig(
         strategy=Strategy.SLIDING_WINDOW, num_slices=6, min_pixels=8))
-    tag_detector = AprilTagDetector(quad_decimate=1.0, nthreads=2)
+    tag_detector = AprilTagDetector(
+        quad_decimate=2.0,
+        quad_sigma=0.2,
+        decode_sharpening=0.3,
+        nthreads=2,
+    )
 
     planner = MissionPlanner(Airports)
     current_turn_bias = "straight"

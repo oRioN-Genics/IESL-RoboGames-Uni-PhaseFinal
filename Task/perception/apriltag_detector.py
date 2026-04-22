@@ -60,8 +60,8 @@ class AprilTagDetector:
         tags = det.detect(gray_frame)   # list[TagResult]
     """
 
-    def __init__(self, *, quad_decimate: float = 1.0, quad_sigma: float = 0.0,
-                 decode_sharpening: float = 0.25, nthreads: int = 2):
+    def __init__(self, *, quad_decimate: float = 2.0, quad_sigma: float = 0.2,
+                 decode_sharpening: float = 0.3, nthreads: int = 2):
         self._detector = _Detector(
             families="tag36h11",
             quad_decimate=quad_decimate,
