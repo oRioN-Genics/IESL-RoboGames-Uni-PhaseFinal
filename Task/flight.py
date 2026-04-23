@@ -21,7 +21,8 @@ sys.path.insert(0, ".")
 
 HEADLESS = True
 LIVE_STREAM_EN = False  # True = Broadcasts MJPEG stream on port 5000
-Airports = [1, 2]
+# Airports = [1, 2]
+Airports = [2, 0]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TUNING
@@ -410,7 +411,7 @@ def run():
     time.sleep(5.0)
 
     # Initialize the threaded camera so the buffer never fills up
-    cam = Camera(host="127.0.0.1", port=8080)
+    cam = Camera(host="127.0.0.1", port=9000)
     cam.start()
 
     if LIVE_STREAM_EN:
@@ -430,15 +431,16 @@ def run():
     current_turn_bias = "straight"
     junction_cooldown = 0
 
-    cv2.namedWindow("Annotated ROI", cv2.WINDOW_NORMAL)
-    cv2.namedWindow("Binary mask",   cv2.WINDOW_NORMAL)
-    cv2.namedWindow("Full frame",    cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Annotated ROI", 520, 340)
-    cv2.resizeWindow("Binary mask",   520, 340)
-    cv2.resizeWindow("Full frame",    520, 340)
-    cv2.moveWindow("Annotated ROI",   0,   40)
-    cv2.moveWindow("Binary mask",   540,   40)
-    cv2.moveWindow("Full frame",      0,  420)
+    if not HEADLESS:
+        cv2.namedWindow("Annotated ROI", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("Binary mask",   cv2.WINDOW_NORMAL)
+        cv2.namedWindow("Full frame",    cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Annotated ROI", 520, 340)
+        cv2.resizeWindow("Binary mask",   520, 340)
+        cv2.resizeWindow("Full frame",    520, 340)
+        cv2.moveWindow("Annotated ROI",   0,   40)
+        cv2.moveWindow("Binary mask",   540,   40)
+        cv2.moveWindow("Full frame",      0,  420)
 
     # ── State ─────────────────────────────────────────────────────────────
     # Auto-start: drone begins searching for line immediately after takeoff.
