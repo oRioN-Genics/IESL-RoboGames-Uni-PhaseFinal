@@ -2,8 +2,8 @@ import time
 from pymavlink import mavutil
 
 def connect(port=14550):
-    print(f"[MAVLink] Connecting to udp:0.0.0.0:{port} ...")
-    # Changed to 127.0.0.1 to ensure it binds correctly to the local MAVProxy router on Debian
+    print(f"[MAVLink] Connecting to udp:127.0.0.1:{port} ...")
+    # Using 127.0.0.1 to properly bind to the local MAVProxy router on Debian
     m = mavutil.mavlink_connection(f"udp:127.0.0.1:{port}")
     m.wait_heartbeat()
     print(f"[MAVLink] Connected to system {m.target_system}")
@@ -18,8 +18,7 @@ def set_mode(m, mode):
 
 def arm(m):
     print("[MAVLink] Arming ...")
-    
-    # The second parameter is 0, which means it will perform all pre-arm safety checks
+    # Normal Arm: performs all pre-arm safety checks
     m.mav.command_long_send(
         m.target_system, m.target_component,
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
@@ -34,10 +33,7 @@ def arm(m):
         time.sleep(0.5)
 
 def send_velocity(m, vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0):
-    """
-    Sends offboard velocity commands to ArduPilot.
-    NED Frame: Positive X is Forward, Positive Y is Right, Positive Z is DOWN.
-    """
+    """Sends offboard velocity commands to ArduPilot."""
     m.mav.set_position_target_local_ned_send(
         0, m.target_system, m.target_component,
         mavutil.mavlink.MAV_FRAME_BODY_NED,
@@ -57,36 +53,50 @@ def takeoff(m, alt):
         if msg:
             current_alt = msg.relative_alt / 1000.0
             print(f"  Alt: {current_alt:.2f} m")
-            # Account for barometer/sensor drift, consider it reached at 95%
+            # Account for barometer/sensor drift
             if current_alt >= (alt - 0.2): 
                 print(f"[MAVLink] Reached target altitude of {alt}m ✅")
                 break
 
-def slow_land(m):
-    print("[MAVLink] Initiating slow GUIDED descent (0.08 m/s) ...")
-    last_print = 0
+def hold_and_land(m):
+    print("[MAVLink] Scrubbing residual momentum before descent...")
+    # Send a strict 0 m/s velocity command in all directions to prevent lateral drift
+    send_velocity(m, vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0)
+    time.sleep(2.0)  # Allow physical airframe to settle
     
-    while True:
-        # Reduced from 0.15 to 0.08 (8 cm/s) for a buttery smooth descent
-        send_velocity(m, vz=0.08)
-        
-        msg = m.recv_match(type="GLOBAL_POSITION_INT", blocking=False)
-        if msg:
-            alt = msg.relative_alt / 1000.0
-            now = time.time()
-            if now - last_print > 0.5:
-                print(f"  Descending... Alt: {alt:.2f} m")
-                last_print = now
-            
-            # Lowered the handover from 0.25m to 0.15m to prevent the "LAND mode plunge"
-            if alt < 0.15:
-                break
-        
-        # Velocity commands must be sent continuously to prevent failsafes
-        time.sleep(0.1)
-
-    print("[MAVLink] Nearing ground. Handing over to auto-LAND to touchdown and disarm...")
+    print("[MAVLink] Configuring descent speeds...")
+    # Cap upper descent speed (WPNAV_SPEED_DN)
+    m.mav.param_set_send(
+        m.target_system, m.target_component,
+        b'WPNAV_SPEED_DN', 30.0,  # 30 cm/s
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+    )
+    time.sleep(0.5)
+    
+    # Cap final touchdown speed (LAND_SPEED)
+    m.mav.param_set_send(
+        m.target_system, m.target_component,
+        b'LAND_SPEED', 15.0,      # 15 cm/s
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+    )
+    time.sleep(1.0) # Let the parameters register in EEPROM
+    
+    print("[MAVLink] Initiating native LAND mode ...")
     set_mode(m, "LAND")
+
+def wait_for_landing(m, timeout=60):
+    print("[MAVLink] Waiting for touchdown and auto-disarm...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        msg = m.recv_match(type="HEARTBEAT", blocking=True, timeout=1.0)
+        if msg:
+            armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+            if not armed:
+                print("[MAVLink] Disarmed — landed safely ✅")
+                return True
+        time.sleep(0.5)
+    print("[MAVLink] ⚠️ Timeout waiting for landing disarm.")
+    return False
 
 def main():
     TARGET_ALTITUDE = 1.2
@@ -108,9 +118,12 @@ def main():
     print(f"[Test] Holding altitude at {TARGET_ALTITUDE}m for {HOLD_TIME} seconds...")
     time.sleep(HOLD_TIME)
     
-    # 5. Execute slow landing
-    slow_land(master)
-    print("[Test] Landing sequence triggered. Script complete.")
+    # 5. Stabilize and execute the dual-stage landing sequence
+    hold_and_land(master)
+    
+    # 6. Block the script from exiting until ArduPilot confirms the motors are off
+    wait_for_landing(master)
+    print("[Test] Flight sequence complete.")
 
 if __name__ == "__main__":
     main()

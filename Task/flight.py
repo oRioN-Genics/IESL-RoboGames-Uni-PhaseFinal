@@ -108,7 +108,7 @@ class NavState(Enum):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def connect(port=14550):
-    m = mavutil.mavlink_connection(f"udp:0.0.0.0:{port}")
+    m = mavutil.mavlink_connection(f"udp:127.0.0.1:{port}")
     print("[MAVLink] Waiting for heartbeat ...")
     m.wait_heartbeat()
     print(f"[MAVLink] Connected — system {m.target_system}")
@@ -127,13 +127,53 @@ def is_armed(m):
     return bool(msg and msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
 
 
+# def arm_and_takeoff(m, alt):
+#     set_mode(m, "GUIDED")
+#     print("[MAVLink] Arming ...")
+#     m.mav.command_long_send(
+#         m.target_system, m.target_component,
+#         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+#         0, 1, 21196, 0, 0, 0, 0, 0)
+
+#     deadline = time.time() + 15
+#     while time.time() < deadline:
+#         if is_armed(m):
+#             print("[MAVLink] Armed ✅")
+#             break
+#         time.sleep(0.3)
+#     else:
+#         raise RuntimeError("[MAVLink] Arming failed — aborting mission")
+
+#     m.mav.command_long_send(
+#         m.target_system, m.target_component,
+#         mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+#         0, 0, 0, 0, 0, 0, 0, alt)
+#     print(f"[MAVLink] Taking off to {alt} m ...")
+
+#     last_log = 0
+#     deadline = time.time() + 35
+#     while time.time() < deadline:
+#         msg = m.recv_match(type="GLOBAL_POSITION_INT",
+#                            blocking=True, timeout=2.0)
+#         if msg is None:
+#             continue
+#         cur = msg.relative_alt / 1000.0
+#         if time.time() - last_log > 0.5:
+#             print(f"  alt: {cur:.2f} m")
+#             last_log = time.time()
+#         if cur >= alt - 0.35:
+#             print(f"[MAVLink] Reached {cur:.2f} m ✅")
+#             return
+#     print("[MAVLink] Takeoff timeout — continuing")
 def arm_and_takeoff(m, alt):
     set_mode(m, "GUIDED")
     print("[MAVLink] Arming ...")
+    
+    # 🚨 CHANGED: Replaced 21196 with 0 to enable pre-arm safety checks
     m.mav.command_long_send(
         m.target_system, m.target_component,
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        0, 1, 21196, 0, 0, 0, 0, 0)
+        0, 1, 0, 0, 0, 0, 0, 0)
 
     deadline = time.time() + 15
     while time.time() < deadline:
@@ -165,7 +205,6 @@ def arm_and_takeoff(m, alt):
             print(f"[MAVLink] Reached {cur:.2f} m ✅")
             return
     print("[MAVLink] Takeoff timeout — continuing")
-
 
 def send_velocity(m, vx=0, vy=0, vz=0, yaw_rate=0):
     m.mav.set_position_target_local_ned_send(
@@ -750,23 +789,33 @@ def run():
 
         if nav_state == NavState.PRE_LAND_ALIGN:
             if pre_land_lock_count >= PRE_LAND_LOCK_FRAMES and current_tag is not None:
-                print("[Nav] ✅ Pre-land alignment locked. → LANDING")
+                print("[Nav] ✅ Pre-land alignment locked. Preparing for touchdown...")
+                
+                # 1. Scrub Momentum
+                send_velocity(master) # Send 0 m/s
+                time.sleep(2.0)       # Let airframe settle
+                
+                # 2. Cap Descent Speeds safely
+                print("[Nav] Configuring descent speeds...")
+                master.mav.param_set_send(master.target_system, master.target_component, b'WPNAV_SPEED_DN', 30.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+                time.sleep(0.2)
+                master.mav.param_set_send(master.target_system, master.target_component, b'LAND_SPEED', 15.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+                time.sleep(0.5)
+
+                # 3. Trigger Native Land
                 nav_state = NavState.LANDING
-                send_velocity(master) # Stop horizontal movement
-                time.sleep(0.4)
                 set_mode(master, "LAND")
-                print("[Nav] Landing ...")
-                touchdown_time = None # Initialize the touchdown timer
+                print("[Nav] Native LAND mode triggered. Descending...")
+                touchdown_time = None
 
         elif nav_state == NavState.LANDING:
-            # We are descending! Because this is an 'elif', the main loop keeps 
-            # running. The camera will NEVER freeze.
             tag_info_str = f"LANDING... Alt: {alt:.2f}m"
             
             if touchdown_time is None:
-                # Detect ground
-                if alt < 0.2 or not is_armed(master):
-                    print("[Nav] Touchdown detected! Waiting 7 seconds on the pad...")
+                # 🚨 SAFEST TOUCHDOWN DETECTION: Wait for ArduPilot to auto-disarm!
+                # We no longer check (alt < 0.2) because ground-effect barometer drift causes false positives.
+                if not is_armed(master):
+                    print("[Nav] Auto-disarm confirmed! Touchdown successful. Waiting 7 seconds on the pad...")
                     touchdown_time = time.time()
             else:
                 # We are on the ground, count down 7 seconds
@@ -776,18 +825,16 @@ def run():
                 if time_on_pad >= 7.0:
                     if current_tag and current_tag.country_code in targets_remaining:
                         targets_remaining.remove(current_tag.country_code)
-                    print(f"[Nav] Landed! Targets remaining: {targets_remaining}")
+                    print(f"[Nav] Pad wait complete! Targets remaining: {targets_remaining}")
 
                     if not targets_remaining:
                         nav_state    = NavState.DONE
                         print("[Nav] 🎉 ALL TARGETS REACHED — MISSION COMPLETE!")
                         tag_info_str = "MISSION COMPLETE!"
                     else:
-                        print("[Nav] Re-taking off to continue mission ...")
+                        print("[Nav] Re-arming and taking off to continue mission ...")
                         arm_and_takeoff(master, ALTITUDE)
                         
-                        # Fix applied here: Wait 5 seconds dynamically while camera 
-                        # safely continues draining the queue in the background
                         print("[Nav] Stabilizing 5 s ...")
                         time.sleep(5.0)
 
@@ -799,6 +846,57 @@ def run():
                         following           = True
                         aligning            = False
                         print(f"[Nav] → POST_LAND_SEARCH (avoiding {(arrival_heading+180) % 360:.0f}°)")
+        # if nav_state == NavState.PRE_LAND_ALIGN:
+        #     if pre_land_lock_count >= PRE_LAND_LOCK_FRAMES and current_tag is not None:
+        #         print("[Nav] ✅ Pre-land alignment locked. → LANDING")
+        #         nav_state = NavState.LANDING
+        #         send_velocity(master) # Stop horizontal movement
+        #         time.sleep(0.4)
+        #         set_mode(master, "LAND")
+        #         print("[Nav] Landing ...")
+        #         touchdown_time = None # Initialize the touchdown timer
+
+        # elif nav_state == NavState.LANDING:
+        #     # We are descending! Because this is an 'elif', the main loop keeps 
+        #     # running. The camera will NEVER freeze.
+        #     tag_info_str = f"LANDING... Alt: {alt:.2f}m"
+            
+        #     if touchdown_time is None:
+        #         # Detect ground
+        #         if alt < 0.2 or not is_armed(master):
+        #             print("[Nav] Touchdown detected! Waiting 7 seconds on the pad...")
+        #             touchdown_time = time.time()
+        #     else:
+        #         # We are on the ground, count down 7 seconds
+        #         time_on_pad = time.time() - touchdown_time
+        #         tag_info_str = f"ON PAD. Waiting: {7.0 - time_on_pad:.1f}s"
+                
+        #         if time_on_pad >= 7.0:
+        #             if current_tag and current_tag.country_code in targets_remaining:
+        #                 targets_remaining.remove(current_tag.country_code)
+        #             print(f"[Nav] Landed! Targets remaining: {targets_remaining}")
+
+        #             if not targets_remaining:
+        #                 nav_state    = NavState.DONE
+        #                 print("[Nav] 🎉 ALL TARGETS REACHED — MISSION COMPLETE!")
+        #                 tag_info_str = "MISSION COMPLETE!"
+        #             else:
+        #                 print("[Nav] Re-taking off to continue mission ...")
+        #                 arm_and_takeoff(master, ALTITUDE)
+                        
+        #                 # Fix applied here: Wait 5 seconds dynamically while camera 
+        #                 # safely continues draining the queue in the background
+        #                 print("[Nav] Stabilizing 5 s ...")
+        #                 time.sleep(5.0)
+
+        #                 # Reset vision trackers for the new flight
+        #                 prev_line_cx        = None
+        #                 line_acquired_since = None
+                        
+        #                 nav_state           = NavState.POST_LAND_SEARCH
+        #                 following           = True
+        #                 aligning            = False
+        #                 print(f"[Nav] → POST_LAND_SEARCH (avoiding {(arrival_heading+180) % 360:.0f}°)")
         
         # ── Line Re-acquisition Logic ────────────────────────────────────
         if following and result.is_detected:
