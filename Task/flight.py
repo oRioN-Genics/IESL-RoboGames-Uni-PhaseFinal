@@ -1,7 +1,8 @@
 from perception.line_detector import LineDetector, LineDetectorConfig, Strategy
 from perception.apriltag_detector import AprilTagDetector, TagResult
 from perception.camera import Camera
-from picamera2 import Picamera2
+from perception.tcp_camera import ThreadedTCPCamera
+# from picamera2 import Picamera2
 from perception.streamer import MJPEGStreamer
 from navigation.mission_planner import MissionPlanner
 import threading
@@ -439,9 +440,9 @@ def run():
     print("[Test] Stabilizing 5 s ...")
     time.sleep(5.0)
 
-    # Initialize the threaded camera so the buffer never fills up
     # cam = Camera(host="127.0.0.1", port=9000)
-    cam = DirectCamera(width=640, height=480)
+    cam = ThreadedTCPCamera(ip="127.0.0.1", port=9000)
+    # cam = DirectCamera(width=640, height=480)
     cam.start()
 
     if LIVE_STREAM_EN:
