@@ -1,8 +1,10 @@
 from perception.line_detector import LineDetector, LineDetectorConfig, Strategy
 from perception.apriltag_detector import AprilTagDetector, TagResult
 from perception.camera import Camera
+from picamera2 import Picamera2
 from perception.streamer import MJPEGStreamer
 from navigation.mission_planner import MissionPlanner
+import threading
 import math
 import sys
 import time
@@ -22,7 +24,7 @@ sys.path.insert(0, ".")
 HEADLESS = True
 LIVE_STREAM_EN = False  # True = Broadcasts MJPEG stream on port 5000
 # Airports = [1, 2]
-Airports = [2, 0]
+Airports = [3, 0]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TUNING
@@ -41,7 +43,7 @@ KD_LAT = 0.0003
 THRESHOLD    = 155
 ROI_TOP_FRAC = 0.40
 ROI_SIDE_FRAC = 0.12
-ALTITUDE     = 1.2   # lowered for better view of ground-level AprilTags
+ALTITUDE     = 0.9  # lowered for better view of ground-level AprilTags
 
 MAX_YAW = 0.50
 MAX_LAT = 0.20
@@ -128,46 +130,24 @@ def is_armed(m):
     return bool(msg and msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
 
 
-# def arm_and_takeoff(m, alt):
-#     set_mode(m, "GUIDED")
-#     print("[MAVLink] Arming ...")
-#     m.mav.command_long_send(
-#         m.target_system, m.target_component,
-#         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-#         0, 1, 21196, 0, 0, 0, 0, 0)
-
-#     deadline = time.time() + 15
-#     while time.time() < deadline:
-#         if is_armed(m):
-#             print("[MAVLink] Armed ✅")
-#             break
-#         time.sleep(0.3)
-#     else:
-#         raise RuntimeError("[MAVLink] Arming failed — aborting mission")
-
-#     m.mav.command_long_send(
-#         m.target_system, m.target_component,
-#         mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-#         0, 0, 0, 0, 0, 0, 0, alt)
-#     print(f"[MAVLink] Taking off to {alt} m ...")
-
-#     last_log = 0
-#     deadline = time.time() + 35
-#     while time.time() < deadline:
-#         msg = m.recv_match(type="GLOBAL_POSITION_INT",
-#                            blocking=True, timeout=2.0)
-#         if msg is None:
-#             continue
-#         cur = msg.relative_alt / 1000.0
-#         if time.time() - last_log > 0.5:
-#             print(f"  alt: {cur:.2f} m")
-#             last_log = time.time()
-#         if cur >= alt - 0.35:
-#             print(f"[MAVLink] Reached {cur:.2f} m ✅")
-#             return
-#     print("[MAVLink] Takeoff timeout — continuing")
 def arm_and_takeoff(m, alt):
     set_mode(m, "GUIDED")
+    
+    print("[MAVLink] Configuring smooth takeoff speeds...")
+    # 1. Cap maximum ascent speed to 50 cm/s (0.5 m/s)
+    m.mav.param_set_send(
+        m.target_system, m.target_component,
+        b'WPNAV_SPEED_UP', 50.0, 
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+    time.sleep(0.2)
+    
+    # 2. Lower vertical acceleration to 50 cm/s/s for a gentle spool-up
+    m.mav.param_set_send(
+        m.target_system, m.target_component,
+        b'WPNAV_ACCEL_Z', 50.0, 
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+    time.sleep(0.5)
+
     print("[MAVLink] Arming ...")
     
     # 🚨 CHANGED: Replaced 21196 with 0 to enable pre-arm safety checks
@@ -189,7 +169,7 @@ def arm_and_takeoff(m, alt):
         m.target_system, m.target_component,
         mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
         0, 0, 0, 0, 0, 0, 0, alt)
-    print(f"[MAVLink] Taking off to {alt} m ...")
+    print(f"[MAVLink] Taking off smoothly to {alt} m ...")
 
     last_log = 0
     deadline = time.time() + 35
@@ -207,6 +187,7 @@ def arm_and_takeoff(m, alt):
             return
     print("[MAVLink] Takeoff timeout — continuing")
 
+
 def send_velocity(m, vx=0, vy=0, vz=0, yaw_rate=0):
     m.mav.set_position_target_local_ned_send(
         0, m.target_system, m.target_component,
@@ -221,14 +202,28 @@ def send_velocity(m, vx=0, vy=0, vz=0, yaw_rate=0):
 
 def make_mask(bgr, _thresh_unused):
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    lower_yellow = np.array([0, 100, 60], dtype=np.uint8)
-    upper_yellow = np.array([15, 255, 255], dtype=np.uint8)
-    m = cv2.inRange(hsv, lower_yellow, upper_yellow)
+    
+    # 1. Lower Red Mask (Catches the bright/orange-reds that were causing spots)
+    # Lowered Saturation to 60 to help with glare
+    lower_red1 = np.array([0, 60, 60], dtype=np.uint8)
+    upper_red1 = np.array([15, 255, 255], dtype=np.uint8)
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    
+    # 2. Upper Red Mask (Catches the deep/dark reds)
+    lower_red2 = np.array([160, 60, 60], dtype=np.uint8)
+    upper_red2 = np.array([179, 255, 255], dtype=np.uint8)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    
+    # 3. Combine them to get a completely solid line!
+    m = cv2.bitwise_or(mask1, mask2)
+    
+    # Existing morphology cleanups
     k = np.ones((3, 3), np.uint8)
     m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  k)
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
     k_bridge = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 21))
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k_bridge)
+    
     return m
 
 def keep_valid_contours(mask, min_area=120, min_thickness=12):
@@ -392,6 +387,40 @@ def draw_tags_on_frame(vis, tags):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
 
+class DirectCamera:
+    def __init__(self, width=640, height=480):
+        self._picam = Picamera2()
+        config = self._picam.create_video_configuration(
+            {"format": "BGR888", "size": (width, height)}
+        )
+        self._picam.configure(config)
+        self._latest_frame = None
+        self._lock = threading.Lock()
+        self._running = False
+
+    def start(self):
+        self._picam.start()
+        self._running = True
+        threading.Thread(target=self._update, daemon=True).start()
+        # Wait for first frame
+        while self._latest_frame is None:
+            time.sleep(0.01)
+        print("[Camera] Direct hardware capture started.")
+
+    def _update(self):
+        while self._running:
+            frame = self._picam.capture_array()
+            with self._lock:
+                self._latest_frame = frame
+
+    def get_frame(self):
+        with self._lock:
+            return self._latest_frame.copy() if self._latest_frame is not None else None
+
+    def stop(self):
+        self._running = False
+        self._picam.stop()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -411,7 +440,8 @@ def run():
     time.sleep(5.0)
 
     # Initialize the threaded camera so the buffer never fills up
-    cam = Camera(host="127.0.0.1", port=9000)
+    # cam = Camera(host="127.0.0.1", port=9000)
+    cam = DirectCamera(width=640, height=480)
     cam.start()
 
     if LIVE_STREAM_EN:
@@ -634,7 +664,7 @@ def run():
 
         # ── Read frame (using non-blocking Threaded Camera) ───────────────
         fetched_frame = cam.get_frame()
-        if fetched_frame is not None:
+        if fetched_frame is not None and fetched_frame.size > 0:
             frame = cv2.resize(fetched_frame, (640, 480))
             last_frm = frame
         else:
@@ -994,7 +1024,8 @@ def run():
                 print("[Manual] Stopped")
 
     cam.stop()
-    cv2.destroyAllWindows()
+    if not HEADLESS:
+        cv2.destroyAllWindows()
     print("[Test] Done.")
 
 
